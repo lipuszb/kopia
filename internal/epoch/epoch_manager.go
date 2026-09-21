@@ -85,6 +85,18 @@ func (p *Parameters) GetEpochCleanupSafetyMargin() time.Duration {
 	return p.CleanupSafetyMargin
 }
 
+func rangeIsFullyCoveredAndOldEnough(ranges []*RangeMetadata, targetMin, targetMax int, maxReplacementTime time.Time) bool {
+	for _, r := range ranges {
+		// Ensure the covering range is strictly larger than [targetMin, targetMax]
+		if (r.MinEpoch < targetMin || r.MaxEpoch > targetMax) &&
+			r.MinEpoch <= targetMin && r.MaxEpoch >= targetMax {
+			return blobSetWrittenEarlyEnough(r.Blobs, maxReplacementTime)
+		}
+	}
+
+	return false
+}
+
 // GetMinEpochDuration returns the minimum duration of an epoch.
 func (p *Parameters) GetMinEpochDuration() time.Duration {
 	return p.MinEpochDuration
@@ -178,6 +190,12 @@ func (cs *CurrentSnapshot) isSettledEpochNumber(epoch int) bool {
 	return epoch <= cs.lastSettledEpochNumber()
 }
 
+// EpochRange represents a range of epochs from Min to Max (inclusive).
+type EpochRange struct {
+	Min int `json:"min"`
+	Max int `json:"max"`
+}
+
 // Manager manages repository epochs.
 type Manager struct {
 	paramProvider ParametersProvider
@@ -220,6 +238,77 @@ const numUnsettledEpochs = 2
 // CompactionFunc merges the given set of index blobs into a new index blob set with a given prefix
 // and writes them out as a set following naming convention established in 'complete_set.go'.
 type CompactionFunc func(ctx context.Context, blobIDs []blob.ID, outputPrefix blob.ID) error
+
+// ComputeConsolidatedXRIndexes determines if the total count of current XR index sets exceeds 
+// epochFrequencyCheckpoint. If so, it computes the consolidated epoch range spanning the existing sets.
+func ComputeConsolidatedXRIndexes(
+	currentXRIndexes []*RangeMetadata,
+	epochFrequencyCheckpoint int,
+) ([]EpochRange, bool, error) {
+	if epochFrequencyCheckpoint <= 0 {
+		return nil, false, errors.New("epochFrequencyCheckpoint must be greater than 0")
+	}
+
+	if len(currentXRIndexes) <= epochFrequencyCheckpoint {
+		return nil, false, nil
+	}
+
+	if len(currentXRIndexes) == 0 {
+		return nil, false, nil
+	}
+
+	minEpoch := currentXRIndexes[0].MinEpoch
+	maxEpoch := currentXRIndexes[0].MaxEpoch
+
+	for _, idx := range currentXRIndexes {
+		if idx.MinEpoch < minEpoch {
+			minEpoch = idx.MinEpoch
+		}
+
+		if idx.MaxEpoch > maxEpoch {
+			maxEpoch = idx.MaxEpoch
+		}
+	}
+
+	newRanges := []EpochRange{
+		{
+			Min: minEpoch,
+			Max: maxEpoch,
+		},
+	}
+
+	return newRanges, true, nil
+}
+
+// CompactXRIndexesIfThresholdExceeded fetches the active XR range checkpoints, checks if their count 
+// exceeds epochFrequencyCheckpoint, and triggers a compaction merge into a consolidated range if needed.
+func (e *Manager) CompactXRIndexesIfThresholdExceeded(ctx context.Context, epochFrequencyCheckpoint int) error {
+	cs, err := e.committedState(ctx, 0)
+	if err != nil {
+		return errors.Wrap(err, "unable to get committed state for xr consolidation")
+	}
+
+	rangesToConsolidate, shouldConsolidate, err := ComputeConsolidatedXRIndexes(cs.LongestRangeCheckpointSets, epochFrequencyCheckpoint)
+	if err != nil {
+		return errors.Wrap(err, "error computing consolidated xr indexes")
+	}
+
+	if !shouldConsolidate {
+		return nil
+	}
+
+	for _, r := range rangesToConsolidate {
+		contentlog.Log2(ctx, e.log, "consolidating xr indexes",
+			logparam.Int("minEpoch", r.Min),
+			logparam.Int("maxEpoch", r.Max))
+
+		if err := e.generateRangeCheckpointFromCommittedState(ctx, cs, r.Min, r.Max); err != nil {
+			return errors.Wrapf(err, "failed to compact range index checkpoint for epochs %v-%v", r.Min, r.Max)
+		}
+	}
+
+	return nil
+}
 
 // Flush waits for all in-process compaction work to complete.
 func (e *Manager) Flush() {
@@ -396,32 +485,25 @@ func (e *Manager) CleanupSupersededIndexes(ctx context.Context) (*maintenancesta
 		return nil, err
 	}
 
-	// find max timestamp recently written to the repository to establish storage clock.
-	// we will be deleting blobs whose timestamps are sufficiently old enough relative
-	// to this max time. This assumes that storage clock moves forward somewhat reasonably.
 	maxTime := e.maxCleanupTime(cs)
 	if maxTime.IsZero() {
 		return nil, nil
 	}
 
-	// only delete blobs if a suitable replacement exists and has been written sufficiently
-	// long ago. we don't want to delete blobs that are created too recently, because other clients
-	// may have not observed them yet.
 	maxReplacementTime := maxTime.Add(-p.CleanupSafetyMargin)
 
 	contentlog.Log1(ctx, e.log, "Cleaning up superseded index blobs...",
 		logparam.Time("maxReplacementTime", maxReplacementTime))
 
-	// delete uncompacted indexes for epochs that already have single-epoch compaction
-	// that was written sufficiently long ago.
+	var deletedTotalSize uint64
+
+	// 1. Delete uncompacted indexes (xn) for epochs covered by single-epoch compaction
 	blobs, err := blob.ListAllBlobs(ctx, e.st, UncompactedIndexBlobPrefix)
 	if err != nil {
 		return nil, errors.Wrap(err, "error listing uncompacted blobs")
 	}
 
 	var toDelete []blob.ID
-
-	var deletedTotalSize uint64
 
 	for _, bm := range blobs {
 		if epoch, ok := epochNumberFromBlobID(bm.BlobID); ok {
@@ -436,11 +518,73 @@ func (e *Manager) CleanupSupersededIndexes(ctx context.Context) (*maintenancesta
 		return nil, errors.Wrap(err, "unable to delete uncompacted blobs")
 	}
 
+	// 2. Delete single-epoch compaction blobs (xs) covered by range checkpoints
+	xsBlobs, err := blob.ListAllBlobs(ctx, e.st, SingleEpochCompactionBlobPrefix)
+	if err != nil {
+		return nil, errors.Wrap(err, "error listing single-epoch compaction blobs")
+	}
+
+	var toDeleteXS []blob.ID
+
+	for _, bm := range xsBlobs {
+		ep, ok := epochNumberFromBlobID(bm.BlobID)
+		if !ok {
+			continue
+		}
+
+		if rangeCoversEpochAndOldEnough(cs.LongestRangeCheckpointSets, ep, maxReplacementTime) {
+			toDeleteXS = append(toDeleteXS, bm.BlobID)
+			deletedTotalSize += maintenancestats.ToUint64(bm.Length)
+		}
+	}
+
+	if err := blob.DeleteMultiple(ctx, e.st, toDeleteXS, p.DeleteParallelism); err != nil {
+		return nil, errors.Wrap(err, "unable to delete superseded single-epoch compaction blobs")
+	}
+
+	toDelete = append(toDelete, toDeleteXS...)
+
+	// 3. Delete superseded range checkpoint blobs (xr) covered by a larger range checkpoint
+	xrBlobs, err := blob.ListAllBlobs(ctx, e.st, RangeCheckpointIndexBlobPrefix)
+	if err != nil {
+		return nil, errors.Wrap(err, "error listing range checkpoint blobs")
+	}
+
+	var toDeleteXR []blob.ID
+
+	for _, bm := range xrBlobs {
+		minEp, maxEp, ok := epochRangeFromBlobID(bm.BlobID)
+		if !ok {
+			continue
+		}
+
+		if rangeIsFullyCoveredAndOldEnough(cs.LongestRangeCheckpointSets, minEp, maxEp, maxReplacementTime) {
+			toDeleteXR = append(toDeleteXR, bm.BlobID)
+			deletedTotalSize += maintenancestats.ToUint64(bm.Length)
+		}
+	}
+
+	if err := blob.DeleteMultiple(ctx, e.st, toDeleteXR, p.DeleteParallelism); err != nil {
+		return nil, errors.Wrap(err, "unable to delete superseded range checkpoint blobs")
+	}
+
+	toDelete = append(toDelete, toDeleteXR...)
+
 	return &maintenancestats.CleanupSupersededIndexesStats{
 		MaxReplacementTime: maxReplacementTime,
 		DeletedBlobCount:   uint64(len(toDelete)),
 		DeletedTotalSize:   deletedTotalSize,
 	}, nil
+}
+
+func rangeCoversEpochAndOldEnough(ranges []*RangeMetadata, epoch int, maxReplacementTime time.Time) bool {
+	for _, r := range ranges {
+		if epoch >= r.MinEpoch && epoch <= r.MaxEpoch {
+			return blobSetWrittenEarlyEnough(r.Blobs, maxReplacementTime)
+		}
+	}
+
+	return false
 }
 
 func blobSetWrittenEarlyEnough(replacementSet []blob.Metadata, maxReplacementTime time.Time) bool {
@@ -590,6 +734,12 @@ func (e *Manager) MaybeGenerateRangeCheckpoint(ctx context.Context) (*maintenanc
 	if err != nil {
 		return nil, err
 	}
+
+	// --- Add XR Consolidation Here ---
+    	if err := e.CompactXRIndexesIfThresholdExceeded(ctx, p.FullCheckpointFrequency); err != nil {
+        	contentlog.Log1(ctx, e.log, "warning: unable to consolidate xr indexes", logparam.Error("error", err))
+    	}
+    	// ---------------------------------
 
 	cs, err := e.committedState(ctx, 0)
 	if err != nil {
